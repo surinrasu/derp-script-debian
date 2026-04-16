@@ -1,0 +1,327 @@
+min_version = "2025.0.0"
+
+[tools]
+go = "latest"
+
+[env]
+DERP_CERT_DIR = "/etc/derper/certs"
+DERP_STATE_DIR = "/var/lib/derper"
+
+[tasks.bootstrap]
+description = "Install Debian packages needed for DERP"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+sudo apt update
+sudo apt install -y curl ca-certificates jq snapd openssl
+sudo systemctl enable --now snapd.socket
+'''
+
+[tasks.certbot-install]
+description = "Install certbot"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+if ! command -v certbot >/dev/null 2>&1; then
+  sudo snap install --classic certbot
+  sudo ln -sf /snap/bin/certbot /usr/local/bin/certbot
+fi
+certbot --version
+'''
+
+[tasks.tailscale-install]
+description = "Install Tailscale"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+sudo mkdir -p --mode=0755 /usr/share/keyrings
+
+curl -fsSL https://pkgs.tailscale.com/stable/debian/trixie.noarmor.gpg \
+  | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+
+curl -fsSL https://pkgs.tailscale.com/stable/debian/trixie.tailscale-keyring.list \
+  | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
+
+sudo apt-get update
+sudo apt-get install -y tailscale
+sudo systemctl enable --now tailscaled
+
+echo
+echo "Installed Tailscale, run `sudo tailscale up` to log in"
+'''
+
+[tasks.build-derper]
+description = "Build derper"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+BIN_DIR="${MISE_CONFIG_ROOT}/.build/bin"
+mkdir -p "$BIN_DIR"
+
+ver="${TAILSCALE_VERSION:-latest}"
+
+if [ "$ver" = "latest" ]; then
+  GOBIN="$BIN_DIR" go install tailscale.com/cmd/derper@latest
+else
+  GOBIN="$BIN_DIR" go install tailscale.com/cmd/derper@"$ver"
+fi
+
+test -x "$BIN_DIR/derper"
+echo "built: $BIN_DIR/derper"
+'''
+
+[tasks.install-derper]
+description = "Install derper binary and state directories"
+depends = ["build-derper"]
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+BIN_DIR="${MISE_CONFIG_ROOT}/.build/bin"
+
+sudo mkdir -p "${DERP_CERT_DIR}" "${DERP_STATE_DIR}"
+sudo install -m 0755 "$BIN_DIR/derper" /usr/local/bin/derper
+/usr/local/bin/derper --help >/dev/null
+'''
+
+[tasks.write-service]
+description = "Write systemd unit"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec="/usr/local/bin/derper --hostname=${DERP_HOST} --certmode=manual --certdir=${DERP_CERT_DIR} -a=:443 --http-port=80 --stun-port=3478 -c=${DERP_STATE_DIR}/derper.key"
+if [ "${DERP_VERIFY_CLIENTS:-0}" = "1" ]; then
+  exec="${exec} --verify-clients"
+fi
+
+sudo tee /etc/systemd/system/derper.service >/dev/null <<EOF
+[Unit]
+Description=Tailscale DERP Server (IP-only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${exec}
+Restart=always
+RestartSec=5
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+systemctl cat derper --no-pager || true
+'''
+
+[tasks.cert-init-staging]
+description = "Issue a staging IP certificate with Let's Encrypt"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+sudo certbot certonly --staging \
+  --preferred-profile shortlived \
+  --standalone \
+  --agree-tos \
+  --no-eff-email \
+  -m "${LE_EMAIL}" \
+  --ip-address "${DERP_IP}"
+'''
+
+[tasks.cert-init]
+description = "Issue a production IP certificate with Let's Encrypt"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+sudo certbot certonly \
+  --preferred-profile shortlived \
+  --standalone \
+  --agree-tos \
+  --no-eff-email \
+  -m "${LE_EMAIL}" \
+  --ip-address "${DERP_IP}"
+'''
+
+[tasks.cert-sync]
+description = "Copy certbot certs into derper manual-cert directory"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+sudo mkdir -p "${DERP_CERT_DIR}"
+sudo cp "/etc/letsencrypt/live/${DERP_IP}/fullchain.pem" "${DERP_CERT_DIR}/${DERP_HOST}.crt"
+sudo cp "/etc/letsencrypt/live/${DERP_IP}/privkey.pem"   "${DERP_CERT_DIR}/${DERP_HOST}.key"
+sudo chmod 644 "${DERP_CERT_DIR}/${DERP_HOST}.crt"
+sudo chmod 600 "${DERP_CERT_DIR}/${DERP_HOST}.key"
+
+sudo ls -l "${DERP_CERT_DIR}/${DERP_HOST}.crt" "${DERP_CERT_DIR}/${DERP_HOST}.key"
+'''
+
+[tasks.start]
+description = "Enable and start derper"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+sudo systemctl enable --now derper
+sudo systemctl --no-pager --full status derper
+'''
+
+[tasks.restart]
+description = "Restart derper"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+sudo systemctl restart derper
+sudo systemctl --no-pager --full status derper
+'''
+
+[tasks.stop]
+description = "Stop derper"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+sudo systemctl stop derper
+'''
+
+[tasks.logs]
+description = "Tail derper logs"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+sudo journalctl -u derper -f
+'''
+
+[tasks.openssl-check]
+description = "Inspect certificate presented by derper"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+echo | openssl s_client -connect "${DERP_HOST}:443" 2>/dev/null | openssl x509 -noout -issuer -subject -dates
+'''
+
+[tasks.netcheck]
+description = "Run tailscale netcheck"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+tailscale netcheck
+'''
+
+[tasks.policy]
+description = "Generate derp-map.json for admin console"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+jq -n \
+  --arg rid   "${DERP_REGION_ID}" \
+  --arg code  "${DERP_REGION_CODE}" \
+  --arg rname "${DERP_REGION_NAME}" \
+  --arg name  "${DERP_NAME}" \
+  --arg host  "${DERP_HOST}" \
+  --arg ip    "${DERP_IP}" \
+'{
+  derpMap: {
+    Regions: {
+      ($rid): {
+        RegionID: ($rid|tonumber),
+        RegionCode: $code,
+        RegionName: $rname,
+        Nodes: [
+          {
+            Name: $name,
+            RegionID: ($rid|tonumber),
+            HostName: $host,
+            IPv4: $ip
+          }
+        ]
+      }
+    }
+  }
+}' | tee derp-map.json
+'''
+
+[tasks.cert-renew]
+description = "Renew short-lived IP cert, sync it, and restart derper"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+sudo systemctl stop derper || true
+sudo certbot renew -q
+sudo cp "/etc/letsencrypt/live/${DERP_IP}/fullchain.pem" "${DERP_CERT_DIR}/${DERP_HOST}.crt"
+sudo cp "/etc/letsencrypt/live/${DERP_IP}/privkey.pem"   "${DERP_CERT_DIR}/${DERP_HOST}.key"
+sudo chmod 644 "${DERP_CERT_DIR}/${DERP_HOST}.crt"
+sudo chmod 600 "${DERP_CERT_DIR}/${DERP_HOST}.key"
+sudo systemctl start derper
+sudo systemctl --no-pager --full status derper
+'''
+
+[tasks.install-timer]
+description = "Install a daily systemd timer for cert renewal"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+script="/usr/local/sbin/renew-derp-ip-cert.sh"
+
+sudo tee "${script}" >/dev/null <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+cd "${PWD}"
+mise run cert-renew
+EOF
+
+sudo chmod +x "${script}"
+
+sudo tee /etc/systemd/system/renew-derp-ip-cert.service >/dev/null <<EOF
+[Unit]
+Description=Renew IP certificate for DERP and restart derper
+
+[Service]
+Type=oneshot
+ExecStart=${script}
+EOF
+
+sudo tee /etc/systemd/system/renew-derp-ip-cert.timer >/dev/null <<EOF
+[Unit]
+Description=Run DERP IP certificate renewal daily
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now renew-derp-ip-cert.timer
+systemctl list-timers --all | grep renew-derp-ip-cert || true
+'''
+
+[tasks.setup]
+description = "Bootstrap packages, build derper, and write service"
+run = [
+  { task = "bootstrap" },
+  { task = "certbot-install" },
+  { task = "build-derper" },
+  { task = "install-derper" },
+  { task = "write-service" },
+]
+
+[tasks.first-run]
+description = "Issue cert, sync it, start derper, and write derp-map.json"
+run = [
+  { task = "cert-init" },
+  { task = "cert-sync" },
+  { task = "start" },
+  { task = "policy" },
+]
